@@ -10,8 +10,9 @@ single message per user session and updates its contents instead of
 spamming the user with new messages.  Listings must be approved by an
 administrator before they become visible.  Messages between buyers and
 sellers are proxied by the bot, and users can mute notifications globally
-or per‐conversation.  The implementation uses SQLite for persistence and
-the `aiogram` library for Telegram integration.
+or per‐conversation.  The implementation uses a PostgreSQL database for
+persistence (via `asyncpg`) and the `aiogram` library for Telegram
+integration.
 
 Categories
 ----------
@@ -74,7 +75,7 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-import aiosqlite
+import asyncpg
 from aiogram import F
 from aiogram.filters import Command, CommandStart, StateFilter
 
@@ -87,6 +88,15 @@ logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = "8210363818:AAFGWN9RxzFQbovE-VE4g0WW0fsOCvUP9Cg"
 ADMIN_ID = 7066340788  # твой Telegram user_id (можно узнать у @userinfobot)
+
+# Database URL for PostgreSQL (Supabase). Use the DATABASE_URL environment
+# variable if set, otherwise fall back to the provided connection string.
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres.pvhnsqyhwfozoyvjsqax:12378945Dv@aws-1-eu-north-1.pooler.supabase.com:5432/postgres",
+)
+# Global asyncpg pool. It will be initialised on first use via pg_create_pool().
+pg_pool = None
 
 
 # List of stopwords to ignore when searching titles.  These are common
@@ -119,8 +129,9 @@ CONDITIONS = ["Новое", "Б/у"]
 CITY_PATTERN = re.compile(r"^[А-Яа-яЁё\s\-]{2,50}$")
 MICRODISTRICT_PATTERN = re.compile(r"^[А-Яа-яЁё0-9\s\-]{2,50}$")
 
-# SQLite database file
-DB_FILENAME = "marketplace.db"
+# NOTE: A SQLite filename was previously used but is retained here only as a
+# placeholder for backwards compatibility.  The bot now uses a PostgreSQL
+# database via asyncpg and the DB_FILENAME constant is not referenced.
 
 
 # ---------------------------------------------------------------------------
@@ -129,22 +140,24 @@ DB_FILENAME = "marketplace.db"
 router = Router()
 
 async def init_db():
-    """Initialise the SQLite database with required tables."""
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        # Users
-        await db.execute(
+    """Initialise the PostgreSQL database with required tables."""
+    # Ensure the asyncpg pool is created
+    pool = await pg_create_pool()
+    async with pool.acquire() as conn:
+        # Users table
+        await conn.execute(
             """CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
+                user_id BIGINT PRIMARY KEY,
                 city TEXT NOT NULL,
                 microdistrict TEXT,
-                muted INTEGER DEFAULT 0
+                muted BOOLEAN DEFAULT FALSE
             )"""
         )
-        # Listings
-        await db.execute(
+        # Listings table
+        await conn.execute(
             """CREATE TABLE IF NOT EXISTS listings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER,
+                id BIGSERIAL PRIMARY KEY,
+                owner_id BIGINT REFERENCES users(user_id),
                 city TEXT NOT NULL,
                 microdistrict TEXT,
                 category TEXT NOT NULL,
@@ -153,108 +166,111 @@ async def init_db():
                 description TEXT,
                 price INTEGER,
                 status TEXT NOT NULL DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(owner_id) REFERENCES users(user_id)
+                created_at TIMESTAMPTZ DEFAULT NOW()
             )"""
         )
-        # Listing photos
-        await db.execute(
+        # Photos table
+        await conn.execute(
             """CREATE TABLE IF NOT EXISTS photos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                listing_id INTEGER,
-                file_id TEXT,
-                FOREIGN KEY(listing_id) REFERENCES listings(id)
+                id BIGSERIAL PRIMARY KEY,
+                listing_id BIGINT REFERENCES listings(id) ON DELETE CASCADE,
+                file_id TEXT
             )"""
         )
-        # Favourites
-        await db.execute(
+        # Favourites table
+        await conn.execute(
             """CREATE TABLE IF NOT EXISTS favourites (
-                user_id INTEGER,
-                listing_id INTEGER,
-                PRIMARY KEY(user_id, listing_id),
-                FOREIGN KEY(user_id) REFERENCES users(user_id),
-                FOREIGN KEY(listing_id) REFERENCES listings(id)
+                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                listing_id BIGINT REFERENCES listings(id) ON DELETE CASCADE,
+                PRIMARY KEY (user_id, listing_id)
             )"""
         )
-        # Messages
-        await db.execute(
+        # Messages table
+        await conn.execute(
             """CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 chat_id TEXT NOT NULL,
-                sender_id INTEGER NOT NULL,
-                receiver_id INTEGER NOT NULL,
-                listing_id INTEGER NOT NULL,
+                sender_id BIGINT NOT NULL,
+                receiver_id BIGINT NOT NULL,
+                listing_id BIGINT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
                 text TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                read INTEGER DEFAULT 0,
-                FOREIGN KEY(listing_id) REFERENCES listings(id)
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                read BOOLEAN DEFAULT FALSE
             )"""
         )
-        # Chat participants (to track chats per user and unread counts)
-        await db.execute(
+        # Chats table
+        await conn.execute(
             """CREATE TABLE IF NOT EXISTS chats (
                 chat_id TEXT PRIMARY KEY,
-                user1_id INTEGER,
-                user2_id INTEGER,
-                listing_id INTEGER,
-                last_message_time TIMESTAMP,
-                FOREIGN KEY(user1_id) REFERENCES users(user_id),
-                FOREIGN KEY(user2_id) REFERENCES users(user_id),
-                FOREIGN KEY(listing_id) REFERENCES listings(id)
+                user1_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                user2_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                listing_id BIGINT REFERENCES listings(id) ON DELETE CASCADE,
+                last_message_time TIMESTAMPTZ
             )"""
         )
-        await db.commit()
 
 
 async def get_or_create_user(user_id: int, city: str = None, microdistrict: str = None) -> None:
     """Insert a user row if not exists, or update city/microdistrict if provided."""
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        cur = await db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-        row = await cur.fetchone()
-        if row:
-            # Update city/microdistrict if provided
-            if city or microdistrict:
-                await db.execute(
-                    "UPDATE users SET city = COALESCE(?, city), microdistrict = COALESCE(?, microdistrict) WHERE user_id = ?",
-                    (city, microdistrict, user_id),
-                )
-                await db.commit()
-        else:
-            await db.execute(
-                "INSERT INTO users (user_id, city, microdistrict) VALUES (?, ?, ?)",
-                (user_id, city or "", microdistrict),
+    # Check if the user already exists
+    row = await pg_fetch_one("SELECT user_id FROM users WHERE user_id = ?", user_id)
+    if row:
+        # Update city and/or microdistrict if provided
+        if city or microdistrict:
+            await pg_execute(
+                "UPDATE users SET city = COALESCE(?, city), microdistrict = COALESCE(?, microdistrict) WHERE user_id = ?",
+                city,
+                microdistrict,
+                user_id,
             )
-            await db.commit()
+    else:
+        # Insert a new user record
+        await pg_execute(
+            "INSERT INTO users (user_id, city, microdistrict) VALUES (?, ?, ?)",
+            user_id,
+            city or "",
+            microdistrict,
+        )
 
 
 async def update_user_mute(user_id: int, muted: bool) -> None:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        await db.execute("UPDATE users SET muted = ? WHERE user_id = ?", (1 if muted else 0, user_id))
-        await db.commit()
+    # Update the muted flag for the user
+    await pg_execute(
+        "UPDATE users SET muted = ? WHERE user_id = ?",
+        1 if muted else 0,
+        user_id,
+    )
 
 
 async def is_user_muted(user_id: int) -> bool:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        cur = await db.execute("SELECT muted FROM users WHERE user_id = ?", (user_id,))
-        row = await cur.fetchone()
-        return bool(row and row[0])
+    # Fetch the muted flag for the user
+    row = await pg_fetch_one("SELECT muted FROM users WHERE user_id = ?", user_id)
+    return bool(row and row[0])
 
 
 async def add_listing(owner_id: int, city: str, microdistrict: str, category: str, condition: str, title: str, description: str, price: int) -> int:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        cur = await db.execute(
-            "INSERT INTO listings (owner_id, city, microdistrict, category, condition, title, description, price) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (owner_id, city, microdistrict, category, condition, title, description, price),
-        )
-        listing_id = cur.lastrowid
-        await db.commit()
-        return listing_id
+    # Insert a new listing and return its ID
+    row = await pg_fetch_one(
+        "INSERT INTO listings (owner_id, city, microdistrict, category, condition, title, description, price) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        owner_id,
+        city,
+        microdistrict,
+        category,
+        condition,
+        title,
+        description,
+        price,
+    )
+    return row[0] if row else None
 
 
 async def add_photo(listing_id: int, file_id: str) -> None:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        await db.execute("INSERT INTO photos (listing_id, file_id) VALUES (?, ?)", (listing_id, file_id))
-        await db.commit()
+    # Add a photo record for a listing
+    await pg_execute(
+        "INSERT INTO photos (listing_id, file_id) VALUES (?, ?)",
+        listing_id,
+        file_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -268,152 +284,164 @@ async def clear_listing_photos(listing_id: int) -> None:
     images.  This helper deletes all photo rows for the listing so new
     images can be added fresh.
     """
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        await db.execute("DELETE FROM photos WHERE listing_id = ?", (listing_id,))
-        await db.commit()
+    # Remove all photos for a listing using PostgreSQL
+    await pg_execute(
+        "DELETE FROM photos WHERE listing_id = ?",
+        listing_id,
+    )
 
 
 async def get_listing(listing_id: int) -> Optional[dict]:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        cur = await db.execute(
-            "SELECT id, owner_id, city, microdistrict, category, condition, title, description, price, status FROM listings WHERE id = ?",
-            (listing_id,),
-        )
-        row = await cur.fetchone()
-        if not row:
-            return None
-        cur_ph = await db.execute("SELECT file_id FROM photos WHERE listing_id = ?", (listing_id,))
-        photos = [r[0] for r in await cur_ph.fetchall()]
-        return {
-            "id": row[0],
-            "owner_id": row[1],
-            "city": row[2],
-            "microdistrict": row[3],
-            "category": row[4],
-            "condition": row[5],
-            "title": row[6],
-            "description": row[7],
-            "price": row[8],
-            "status": row[9],
-            "photos": photos,
-        }
+    # Fetch a listing and its photos from PostgreSQL
+    row = await pg_fetch_one(
+        "SELECT id, owner_id, city, microdistrict, category, condition, title, description, price, status FROM listings WHERE id = ?",
+        listing_id,
+    )
+    if not row:
+        return None
+    photo_rows = await pg_fetch_all(
+        "SELECT file_id FROM photos WHERE listing_id = ?",
+        listing_id,
+    )
+    photos = [r[0] for r in photo_rows]
+    return {
+        "id": row[0],
+        "owner_id": row[1],
+        "city": row[2],
+        "microdistrict": row[3],
+        "category": row[4],
+        "condition": row[5],
+        "title": row[6],
+        "description": row[7],
+        "price": row[8],
+        "status": row[9],
+        "photos": photos,
+    }
 
 
 async def list_user_listings(user_id: int, status_filter: Optional[str] = None, offset: int = 0, limit: int = 5) -> List[dict]:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        if status_filter:
-            cur = await db.execute(
-                "SELECT id, title, price FROM listings WHERE owner_id = ? AND status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                (user_id, status_filter, limit, offset),
-            )
-        else:
-            cur = await db.execute(
-                "SELECT id, title, price FROM listings WHERE owner_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                (user_id, limit, offset),
-            )
-        rows = await cur.fetchall()
-        return [
-            {"id": r[0], "title": r[1], "price": r[2]} for r in rows
-        ]
+    # List listings for a user from PostgreSQL
+    if status_filter:
+        rows = await pg_fetch_all(
+            "SELECT id, title, price FROM listings WHERE owner_id = ? AND status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            user_id,
+            status_filter,
+            limit,
+            offset,
+        )
+    else:
+        rows = await pg_fetch_all(
+            "SELECT id, title, price FROM listings WHERE owner_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            user_id,
+            limit,
+            offset,
+        )
+    return [{"id": r[0], "title": r[1], "price": r[2]} for r in rows]
 
 
 async def list_pending_listings(offset: int = 0, limit: int = 5) -> List[dict]:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        cur = await db.execute(
-            "SELECT id, owner_id, title, category, price FROM listings WHERE status = 'pending' ORDER BY created_at ASC LIMIT ? OFFSET ?",
-            (limit, offset),
-        )
-        rows = await cur.fetchall()
-        return [
-            {
-                "id": r[0],
-                "owner_id": r[1],
-                "title": r[2],
-                "category": r[3],
-                "price": r[4],
-            }
-            for r in rows
-        ]
+    rows = await pg_fetch_all(
+        "SELECT id, owner_id, title, category, price FROM listings WHERE status = 'pending' ORDER BY created_at ASC LIMIT ? OFFSET ?",
+        limit,
+        offset,
+    )
+    return [
+        {
+            "id": r[0],
+            "owner_id": r[1],
+            "title": r[2],
+            "category": r[3],
+            "price": r[4],
+        }
+        for r in rows
+    ]
 
 
 async def update_listing_status(listing_id: int, status: str) -> None:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        await db.execute("UPDATE listings SET status = ? WHERE id = ?", (status, listing_id))
-        await db.commit()
+    await pg_execute(
+        "UPDATE listings SET status = ? WHERE id = ?",
+        status,
+        listing_id,
+    )
 
 
 async def update_listing_field(listing_id: int, field: str, value) -> None:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        await db.execute(f"UPDATE listings SET {field} = ? WHERE id = ?", (value, listing_id))
-        await db.commit()
+    # Update a specific field on a listing
+    await pg_execute(
+        f"UPDATE listings SET {field} = ? WHERE id = ?",
+        value,
+        listing_id,
+    )
 
 
 async def search_listings(city: str, microdistrict: Optional[str], category: Optional[str], condition: Optional[str], query: str, offset: int = 0, limit: int = 10) -> List[dict]:
     """Search for listings matching the criteria in the same city (and optionally microdistrict)."""
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        # Build dynamic SQL query
-        base_query = "SELECT id, title, price, category, condition FROM listings WHERE status = 'approved' AND city = ?"
-        params: List = [city]
-        # We intentionally ignore microdistrict when searching to broaden results
-        if category:
-            base_query += " AND category = ?"
-            params.append(category)
-        if condition:
-            base_query += " AND condition = ?"
-            params.append(condition)
-        # Prepare search terms (remove stopwords and punctuation, case‐insensitive)
-        terms = [
-            t.lower()
-            for t in re.split("\W+", query)
-            if t and t.lower() not in STOPWORDS
-        ]
-        # Title and description search
-        if terms:
-            like_clauses = ["(title LIKE ? OR description LIKE ?)"] * len(terms)
-            base_query += " AND " + " AND ".join(like_clauses)
-            for t in terms:
-                params.extend([f"%{t}%", f"%{t}%"])
-        base_query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-        cur = await db.execute(base_query, tuple(params))
-        rows = await cur.fetchall()
-        return [
-            {
-                "id": r[0],
-                "title": r[1],
-                "price": r[2],
-                "category": r[3],
-                "condition": r[4],
-            }
-            for r in rows
-        ]
+    # Build dynamic SQL query for PostgreSQL
+    base_query = "SELECT id, title, price, category, condition FROM listings WHERE status = 'approved' AND city = ?"
+    params: List = [city]
+    # We intentionally ignore microdistrict when searching to broaden results
+    if category:
+        base_query += " AND category = ?"
+        params.append(category)
+    if condition:
+        base_query += " AND condition = ?"
+        params.append(condition)
+    # Prepare search terms (remove stopwords and punctuation, case-insensitive)
+    terms = [
+        t.lower()
+        for t in re.split("\W+", query)
+        if t and t.lower() not in STOPWORDS
+    ]
+    if terms:
+        like_clauses = ["(title ILIKE ? OR description ILIKE ?)"] * len(terms)
+        base_query += " AND " + " AND ".join(like_clauses)
+        for t in terms:
+            pattern = f"%{t}%"
+            params.extend([pattern, pattern])
+    base_query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    rows = await pg_fetch_all(base_query, *params)
+    return [
+        {
+            "id": r[0],
+            "title": r[1],
+            "price": r[2],
+            "category": r[3],
+            "condition": r[4],
+        }
+        for r in rows
+    ]
 
 
 async def add_favourite(user_id: int, listing_id: int) -> None:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        try:
-            await db.execute("INSERT INTO favourites (user_id, listing_id) VALUES (?, ?)", (user_id, listing_id))
-            await db.commit()
-        except aiosqlite.IntegrityError:
-            pass  # Already in favourites
+    # Insert favourite and ignore duplicates
+    try:
+        await pg_execute(
+            "INSERT INTO favourites (user_id, listing_id) VALUES (?, ?)",
+            user_id,
+            listing_id,
+        )
+    except Exception:
+        # Ignore unique constraint violations (duplicate favourites)
+        pass
 
 
 async def remove_favourite(user_id: int, listing_id: int) -> None:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        await db.execute("DELETE FROM favourites WHERE user_id = ? AND listing_id = ?", (user_id, listing_id))
-        await db.commit()
+    await pg_execute(
+        "DELETE FROM favourites WHERE user_id = ? AND listing_id = ?",
+        user_id,
+        listing_id,
+    )
 
 
 async def list_favourites(user_id: int, offset: int = 0, limit: int = 5) -> List[dict]:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        cur = await db.execute(
-            "SELECT l.id, l.title, l.price FROM listings l JOIN favourites f ON l.id = f.listing_id WHERE f.user_id = ? AND l.status = 'approved' ORDER BY l.created_at DESC LIMIT ? OFFSET ?",
-            (user_id, limit, offset),
-        )
-        rows = await cur.fetchall()
-        return [
-            {"id": r[0], "title": r[1], "price": r[2]} for r in rows
-        ]
+    rows = await pg_fetch_all(
+        "SELECT l.id, l.title, l.price FROM listings l JOIN favourites f ON l.id = f.listing_id WHERE f.user_id = ? AND l.status = 'approved' ORDER BY l.created_at DESC LIMIT ? OFFSET ?",
+        user_id,
+        limit,
+        offset,
+    )
+    return [{"id": r[0], "title": r[1], "price": r[2]} for r in rows]
 
 
 def chat_id_from_users(user1: int, user2: int, listing_id: int) -> str:
@@ -424,78 +452,92 @@ def chat_id_from_users(user1: int, user2: int, listing_id: int) -> str:
 
 
 async def ensure_chat(chat_id: str, user1: int, user2: int, listing_id: int) -> None:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        cur = await db.execute("SELECT chat_id FROM chats WHERE chat_id = ?", (chat_id,))
-        row = await cur.fetchone()
-        if not row:
-            await db.execute(
-                "INSERT INTO chats (chat_id, user1_id, user2_id, listing_id, last_message_time) VALUES (?, ?, ?, ?, datetime('now'))",
-                (chat_id, user1, user2, listing_id),
-            )
-            await db.commit()
+    # Ensure chat exists in PostgreSQL; create if missing
+    row = await pg_fetch_one(
+        "SELECT chat_id FROM chats WHERE chat_id = ?",
+        chat_id,
+    )
+    if not row:
+        await pg_execute(
+            "INSERT INTO chats (chat_id, user1_id, user2_id, listing_id, last_message_time) VALUES (?, ?, ?, ?, NOW())",
+            chat_id,
+            user1,
+            user2,
+            listing_id,
+        )
 
 
 async def store_message(chat_id: str, sender_id: int, receiver_id: int, listing_id: int, text: str) -> None:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        await db.execute(
-            "INSERT INTO messages (chat_id, sender_id, receiver_id, listing_id, text) VALUES (?, ?, ?, ?, ?)",
-            (chat_id, sender_id, receiver_id, listing_id, text),
-        )
-        # Update last_message_time on chat
-        await db.execute(
-            "UPDATE chats SET last_message_time = datetime('now') WHERE chat_id = ?",
-            (chat_id,),
-        )
-        # Mark messages from receiver as read when sender replies
-        await db.execute(
-            "UPDATE messages SET read = 1 WHERE chat_id = ? AND receiver_id = ?",
-            (chat_id, sender_id),
-        )
-        await db.commit()
+    # Store a message and update chat metadata in a single transaction
+    pool = await pg_create_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                convert_sql("INSERT INTO messages (chat_id, sender_id, receiver_id, listing_id, text) VALUES (?, ?, ?, ?, ?)"),
+                chat_id,
+                sender_id,
+                receiver_id,
+                listing_id,
+                text,
+            )
+            # Update last_message_time
+            await conn.execute(
+                convert_sql("UPDATE chats SET last_message_time = NOW() WHERE chat_id = ?"),
+                chat_id,
+            )
+            # Mark previous messages from receiver as read
+            await conn.execute(
+                convert_sql("UPDATE messages SET read = 1 WHERE chat_id = ? AND receiver_id = ?"),
+                chat_id,
+                sender_id,
+            )
 
 
 async def fetch_messages(chat_id: str, offset: int = 0, limit: int = 5, reverse: bool = True) -> List[dict]:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        order = "DESC" if reverse else "ASC"
-        cur = await db.execute(
-            f"SELECT sender_id, receiver_id, text, created_at FROM messages WHERE chat_id = ? ORDER BY id {order} LIMIT ? OFFSET ?",
-            (chat_id, limit, offset),
-        )
-        rows = await cur.fetchall()
-        messages = [
-            {
-                "sender_id": r[0],
-                "receiver_id": r[1],
-                "text": r[2],
-                "created_at": r[3],
-            }
-            for r in rows
-        ]
-        if reverse:
-            messages.reverse()  # return chronological order
-        return messages
+    order = "DESC" if reverse else "ASC"
+    # Build query with dynamic order
+    query = f"SELECT sender_id, receiver_id, text, created_at FROM messages WHERE chat_id = ? ORDER BY id {order} LIMIT ? OFFSET ?"
+    rows = await pg_fetch_all(
+        query,
+        chat_id,
+        limit,
+        offset,
+    )
+    messages = [
+        {
+            "sender_id": r[0],
+            "receiver_id": r[1],
+            "text": r[2],
+            "created_at": r[3],
+        }
+        for r in rows
+    ]
+    if reverse:
+        messages.reverse()
+    return messages
 
 
 async def list_user_chats(user_id: int, offset: int = 0, limit: int = 5) -> List[dict]:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        cur = await db.execute(
-            "SELECT chat_id, user1_id, user2_id, listing_id FROM chats WHERE user1_id = ? OR user2_id = ? ORDER BY last_message_time DESC LIMIT ? OFFSET ?",
-            (user_id, user_id, limit, offset),
-        )
-        rows = await cur.fetchall()
-        chats = []
-        for r in rows:
-            chat_id = r[0]
-            user1 = r[1]
-            user2 = r[2]
-            listing_id = r[3]
-            partner_id = user2 if user1 == user_id else user1
-            chats.append({
-                "chat_id": chat_id,
-                "partner_id": partner_id,
-                "listing_id": listing_id,
-            })
-        return chats
+    rows = await pg_fetch_all(
+        "SELECT chat_id, user1_id, user2_id, listing_id FROM chats WHERE user1_id = ? OR user2_id = ? ORDER BY last_message_time DESC LIMIT ? OFFSET ?",
+        user_id,
+        user_id,
+        limit,
+        offset,
+    )
+    chats = []
+    for r in rows:
+        chat_id_val = r[0]
+        user1 = r[1]
+        user2 = r[2]
+        listing_id = r[3]
+        partner_id = user2 if user1 == user_id else user1
+        chats.append({
+            "chat_id": chat_id_val,
+            "partner_id": partner_id,
+            "listing_id": listing_id,
+        })
+    return chats
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +602,86 @@ class Session:
 # In-memory mapping from user_id to Session (store message id and menu name)
 SESSIONS: Dict[int, Session] = {}
 
+# ---------------------------------------------------------------------------
+# PostgreSQL helper functions
+# ---------------------------------------------------------------------------
+async def pg_create_pool():
+    """
+    Initialise a global asyncpg connection pool if it has not been created yet.
+
+    Returns the pool instance.  This function is idempotent and safe to call
+    multiple times.
+    """
+    global pg_pool
+    if pg_pool is None:
+        pg_pool = await asyncpg.create_pool(DATABASE_URL)
+    return pg_pool
+
+
+def convert_sql(sql: str) -> str:
+    """
+    Convert SQLite-style '?' placeholders to asyncpg-style '$1', '$2', etc.
+
+    The bot code was originally written for aiosqlite which uses '?' as the
+    parameter placeholder.  asyncpg requires positional parameters denoted
+    by '$1', '$2' and so on.  This simple converter splits the SQL query
+    on '?' and inserts incremental indices.  It assumes that '?' does not
+    appear inside string literals.
+    """
+    parts = sql.split("?")
+    if len(parts) == 1:
+        return sql
+    out = parts[0]
+    for i in range(1, len(parts)):
+        out += f"${i}" + parts[i]
+    return out
+
+
+async def pg_execute(sql: str, *args) -> None:
+    """
+    Execute a SQL statement without returning any rows.
+
+    Parameters are passed positionally and converted for asyncpg via
+    convert_sql().
+    """
+    pool = await pg_create_pool()
+    query = convert_sql(sql)
+    async with pool.acquire() as conn:
+        await conn.execute(query, *args)
+
+
+async def pg_fetch_one(sql: str, *args):
+    """
+    Execute a SQL query and return a single row or None.
+
+    The returned row is an asyncpg.Record which can be indexed by
+    position or column name.  If no row is found, None is returned.
+    """
+    pool = await pg_create_pool()
+    query = convert_sql(sql)
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(query, *args)
+
+
+async def pg_fetch_all(sql: str, *args):
+    """
+    Execute a SQL query and return all rows as a list of Records.
+    """
+    pool = await pg_create_pool()
+    query = convert_sql(sql)
+    async with pool.acquire() as conn:
+        return await conn.fetch(query, *args)
+
+
+async def pg_fetch_value(sql: str, *args):
+    """
+    Execute a SQL query and return a single scalar value.
+    """
+    pool = await pg_create_pool()
+    query = convert_sql(sql)
+    async with pool.acquire() as conn:
+        return await conn.fetchval(query, *args)
+
 
 # ---------------------------------------------------------------------------
 # Bot initialisation
@@ -579,12 +701,13 @@ dp.include_router(router)
 # ---------------------------------------------------------------------------
 
 async def get_user_info(user_id: int) -> Optional[Dict[str, str]]:
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        cur = await db.execute("SELECT city, microdistrict FROM users WHERE user_id = ?", (user_id,))
-        row = await cur.fetchone()
-        if row:
-            return {"city": row[0], "microdistrict": row[1]}
-        return None
+    row = await pg_fetch_one(
+        "SELECT city, microdistrict FROM users WHERE user_id = ?",
+        user_id,
+    )
+    if row:
+        return {"city": row[0], "microdistrict": row[1]}
+    return None
 
 
 async def ensure_session_message(chat_id: int, text: str, keyboard: InlineKeyboardMarkup) -> int:
@@ -659,16 +782,17 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     user_id = message.from_user.id
     # Check if user exists in DB
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        cur = await db.execute("SELECT city FROM users WHERE user_id = ?", (user_id,))
-        row = await cur.fetchone()
-        if row and row[0]:
-            # Already registered: show main menu
-            await show_main_menu(user_id)
-        else:
-            # Ask for city
-            await bot.send_message(user_id, "Добро пожаловать в барахолку! Пожалуйста, укажите ваш город.")
-            await state.set_state(Registration.awaiting_city)
+    row = await pg_fetch_one(
+        "SELECT city FROM users WHERE user_id = ?",
+        user_id,
+    )
+    if row and row[0]:
+        # Already registered: show main menu
+        await show_main_menu(user_id)
+    else:
+        # Ask for city
+        await bot.send_message(user_id, "Добро пожаловать в барахолку! Пожалуйста, укажите ваш город.")
+        await state.set_state(Registration.awaiting_city)
 
 
 @router.message(StateFilter(Registration.awaiting_city))
@@ -959,12 +1083,12 @@ async def view_listing(callback: CallbackQuery, state: FSMContext) -> None:
         text_lines.append(f"Локация: {loc}")
     text_lines.append(desc)
     # Determine if user has favourited this listing
-    async with aiosqlite.connect(DB_FILENAME) as db:
-        cur = await db.execute(
-            "SELECT 1 FROM favourites WHERE user_id = ? AND listing_id = ?", (user_id, listing_id)
-        )
-        fav_row = await cur.fetchone()
-        is_fav = bool(fav_row)
+    fav_row = await pg_fetch_one(
+        "SELECT 1 FROM favourites WHERE user_id = ? AND listing_id = ?",
+        user_id,
+        listing_id,
+    )
+    is_fav = bool(fav_row)
     # Buttons: favourite/unfavourite, report, message seller, back
     action_buttons = []
     if is_fav:
