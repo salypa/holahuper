@@ -132,6 +132,34 @@ MICRODISTRICT_PATTERN = re.compile(r"^[А-Яа-яЁё0-9\s\-]{2,50}$")
 # database via asyncpg and the DB_FILENAME constant is not referenced.
 
 
+def normalize_city(name: str) -> str:
+    """
+    Normalise a city name to a canonical capitalisation.
+
+    This function trims whitespace, collapses multiple spaces, and then
+    capitalises each word as well as hyphen-separated segments.  It helps
+    ensure that variations like "балашиха", "Балашиха" or "балашиХа"
+    are stored consistently as "Балашиха".  Hyphenated names are treated
+    similarly: "санкт-петербург" → "Санкт-Петербург".  The original
+    input is not modified if it does not match the expected pattern.
+    """
+    name = name.strip()
+    # Split by whitespace to handle multi-word names
+    words = name.split()
+    normalised_words: List[str] = []
+    for word in words:
+        # Split by hyphens within each word
+        parts = word.split("-")
+        normalised_parts: List[str] = []
+        for part in parts:
+            if part:
+                normalised_parts.append(part[0].upper() + part[1:].lower())
+            else:
+                normalised_parts.append(part)
+        normalised_words.append("-".join(normalised_parts))
+    return " ".join(normalised_words)
+
+
 # ---------------------------------------------------------------------------
 # Database helper functions
 # ---------------------------------------------------------------------------
@@ -233,11 +261,9 @@ async def get_or_create_user(user_id: int, city: str = None, microdistrict: str 
 
 async def update_user_mute(user_id: int, muted: bool) -> None:
     # Update the muted flag for the user
-    # Update muted flag using a boolean literal.  asyncpg will cast
-    # Python True/False to PostgreSQL BOOLEAN automatically.
     await pg_execute(
         "UPDATE users SET muted = ? WHERE user_id = ?",
-        muted,
+        1 if muted else 0,
         user_id,
     )
 
@@ -493,19 +519,6 @@ async def _message(chat_id: str, sender_id: int, receiver_id: int, listing_id: i
           )
 
 
-async def store_message(chat_id: str, sender_id: int, receiver_id: int, listing_id: int, text: str) -> None:
-    """
-    Persist a chat message to the database.
-
-    This thin wrapper calls the underlying `_message` function, allowing
-    legacy call sites to remain unchanged.  It mirrors the signature of
-    `_message` and forwards all parameters.  Without this wrapper the
-    handler would raise a NameError, as seen in logs when `store_message`
-    was not defined.
-    """
-    await _message(chat_id, sender_id, receiver_id, listing_id, text)
-
-
 
 async def fetch_messages(chat_id: str, offset: int = 0, limit: int = 5, reverse: bool = True) -> List[dict]:
     order = "DESC" if reverse else "ASC"
@@ -726,13 +739,6 @@ async def get_user_info(user_id: int) -> Optional[Dict[str, str]]:
 
 async def ensure_session_message(chat_id: int, text: str, keyboard: InlineKeyboardMarkup) -> int:
     """Send a new message or edit the existing session message for the user."""
-    # Telegram does not allow sending completely empty messages.  If the
-    # provided text is empty or whitespace, substitute a placeholder so
-    # the request succeeds.  Without this guard, `send_message` will
-    # raise `TelegramBadRequest: message text is empty`.
-    if not text or not text.strip():
-        text = "Нет сообщений."
-
     session = SESSIONS.get(chat_id)
     if session:
         try:
@@ -824,6 +830,8 @@ async def process_city(message: Message, state: FSMContext) -> None:
     if not CITY_PATTERN.match(city):
         await message.answer("Название города должно содержать только буквы, пробелы или дефис и быть не короче 2 символов. Попробуйте ещё раз.")
         return
+    # Normalise to canonical capitalisation to avoid duplicates like "балашиха"/"Балашиха"
+    city = normalize_city(city)
     await get_or_create_user(user_id, city=city)
     await bot.send_message(user_id, "Укажите ваш микрорайон (можно пропустить, отправив '-').")
     await state.update_data(city=city)
@@ -905,6 +913,8 @@ async def settings_process_city(message: Message, state: FSMContext) -> None:
             "Название города должно содержать только буквы, пробелы или дефис и быть не короче 2 символов. Попробуйте ещё раз."
         )
         return
+    # Normalise to canonical capitalisation
+    city = normalize_city(city)
     # Save city to state and ask for microdistrict
     await state.update_data(new_city=city)
     await bot.send_message(user_id, "Введите новый микрорайон (или '-' чтобы пропустить):")
@@ -1613,29 +1623,17 @@ async def start_chat(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(StateFilter(ChatStates.chatting), F.data.startswith("load_more_"))
 async def load_more_messages(callback: CallbackQuery, state: FSMContext) -> None:
-    """Load additional messages in the chat and refresh the view.
-
-    This handler increments the offset stored in the FSM state and fetches
-    all messages up to the new offset.  It then constructs the chat
-    transcript for the current user, ensuring that at least a placeholder
-    message is sent when there are no messages.  Without this logic the
-    bot could attempt to send an empty message, leading to a Telegram
-    `BadRequest`.
-    """
     user_id = callback.from_user.id
     data = await state.get_data()
     chat_id = data.get("active_chat")
     offset = data.get("offset", 0)
-    limit = 5
-    # Increase the offset by the page size
-    new_offset = offset + limit
-    # Fetch all messages up to the new offset in chronological order
-    msgs = await fetch_messages(chat_id, offset=0, limit=new_offset, reverse=True)
+    new_offset = offset + 5
+    msgs = await fetch_messages(chat_id, offset=offset, limit=5)
     lines: List[str] = []
-    for m in msgs:
+    for m in msgs + await fetch_messages(chat_id, offset=0, limit=offset, reverse=True):
         sender_label = "Вы" if m["sender_id"] == user_id else "Собеседник"
         lines.append(f"<b>{sender_label}:</b> {m['text']}")
-    chat_text = "\n".join(lines) if lines else "Нет сообщений."
+    chat_text = "\n".join(lines)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Загрузить ещё", callback_data=f"load_more_{chat_id}")],
@@ -1643,7 +1641,6 @@ async def load_more_messages(callback: CallbackQuery, state: FSMContext) -> None
         ]
     )
     await ensure_session_message(user_id, chat_text, kb)
-    # Update the offset in the FSM state so next load fetches further back
     await state.update_data(offset=new_offset)
     await callback.answer()
 
