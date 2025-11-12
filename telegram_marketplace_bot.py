@@ -465,7 +465,7 @@ async def ensure_chat(chat_id: str, user1: int, user2: int, listing_id: int) -> 
         )
 
 
-async def store_message(chat_id: str, sender_id: int, receiver_id: int, listing_id: int, text: str) -> None:
+async def _message(chat_id: str, sender_id: int, receiver_id: int, listing_id: int, text: str) -> None:
     # Store a message and update chat metadata in a single transaction
     pool = await pg_create_pool()
     async with pool.acquire() as conn:
@@ -485,10 +485,11 @@ async def store_message(chat_id: str, sender_id: int, receiver_id: int, listing_
             )
             # Mark previous messages from receiver as read
             await conn.execute(
-                convert_sql("UPDATE messages SET read = 1 WHERE chat_id = ? AND receiver_id = ?"),
-                chat_id,
-                sender_id,
-            )
+              convert_sql("UPDATE messages SET read = TRUE WHERE chat_id = ? AND receiver_id = ?"),
+              chat_id,
+              sender_id,
+          )
+
 
 
 async def fetch_messages(chat_id: str, offset: int = 0, limit: int = 5, reverse: bool = True) -> List[dict]:
