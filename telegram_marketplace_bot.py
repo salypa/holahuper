@@ -390,7 +390,7 @@ async def search_listings(city: str, microdistrict: Optional[str], category: Opt
     # Prepare search terms (remove stopwords and punctuation, case-insensitive)
     terms = [
         t.lower()
-        for t in re.split("\W+", query)
+        for t in re.split(r"\W+", query)
         if t and t.lower() not in STOPWORDS
     ]
     if terms:
