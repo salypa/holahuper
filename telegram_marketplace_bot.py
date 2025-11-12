@@ -93,7 +93,7 @@ ADMIN_ID = 7066340788  # твой Telegram user_id (можно узнать у @
 # variable if set, otherwise fall back to the provided connection string.
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://postgres.pvhnsqyhwfozoyvjsqax:12378945Dv@aws-1-eu-north-1.pooler.supabase.com:5432/postgres",
+    "postgresql://postgres.pvhnsqyhwfozoyvjsqax:12378945Dv*@aws-1-eu-north-1.pooler.supabase.com:5432/postgres",
 )
 # Global asyncpg pool. It will be initialised on first use via pg_create_pool().
 pg_pool = None
